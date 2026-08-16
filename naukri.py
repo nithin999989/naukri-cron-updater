@@ -3,6 +3,7 @@
 """Naukri Daily update - Using Chrome"""
 
 import io
+import json
 import logging
 import os
 import sys
@@ -298,6 +299,51 @@ def LoadNaukri(headless):
 
 
 
+COOKIES_FILE = os.path.abspath(getattr(constants, "COOKIES_FILE", "naukri_cookies.json"))
+
+
+def login_with_cookies(driver):
+    """Attempts to restore an active Naukri session using saved cookies"""
+    if not os.path.exists(COOKIES_FILE):
+        return False
+    try:
+        log_msg("Found saved session cookies, attempting instant cookie login...")
+        driver.get(NaukriURL)
+        time.sleep(2)
+
+        with open(COOKIES_FILE, "r") as f:
+            cookies = json.load(f)
+        for cookie in cookies:
+            cookie.pop("sameSite", None)
+            try:
+                driver.add_cookie(cookie)
+            except Exception:
+                pass
+
+        driver.get(constants.NAUKRI_PROFILE_URL)
+        time.sleep(3)
+
+        if "profile" in driver.current_url.lower() or "mnjuser" in driver.current_url.lower():
+            log_msg("Session restored successfully via saved cookies (bypassed OTP/login form)!")
+            return True
+        log_msg("Saved cookies expired, falling back to credentials login...")
+        return False
+    except Exception as e:
+        log_msg(f"Cookie login exception ({e}), falling back to credentials...")
+        return False
+
+
+def save_session_cookies(driver):
+    """Saves active session cookies to file for future passwordless/OTP-less runs"""
+    try:
+        cookies = driver.get_cookies()
+        with open(COOKIES_FILE, "w") as f:
+            json.dump(cookies, f)
+        log_msg(f"Saved active session cookies to {COOKIES_FILE}")
+    except Exception as e:
+        log_msg(f"Failed to save session cookies: {e}")
+
+
 def naukriLogin(headless=False):
     """Open Chrome browser and Login to Naukri.com"""
     status = False
@@ -314,6 +360,11 @@ def naukriLogin(headless=False):
 
     try:
         driver = LoadNaukri(headless)
+
+        # 1. Try instant login using saved session cookies first (bypasses OTP)
+        if login_with_cookies(driver):
+            status = True
+            return (status, driver)
 
         log_msg(f"Page Title: {driver.title}")
         if "naukri.com" in driver.title.lower():
@@ -385,12 +436,14 @@ def naukriLogin(headless=False):
                 current_url = driver.current_url.lower()
                 if "mnjuser" in current_url or "homepage" in current_url or "profile" in current_url:
                     log_msg(f"Naukri Login Successful! (Redirected to {driver.current_url})")
+                    save_session_cookies(driver)
                     status = True
                     return (status, driver)
 
                 for ind in success_indicators:
                     if is_element_present(driver, By.XPATH, ind):
                         log_msg("Naukri Login Successful! (Dashboard element detected)")
+                        save_session_cookies(driver)
                         status = True
                         return (status, driver)
                 time.sleep(1)
@@ -405,6 +458,7 @@ def naukriLogin(headless=False):
     except Exception as e:
         catch(e)
     return (status, driver)
+
 
 
 
