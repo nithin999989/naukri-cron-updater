@@ -211,19 +211,20 @@ def ci(xpath_part: str) -> str:
 
 
 def tearDown(driver):
+    if driver is None:
+        return
     try:
         driver.close()
         log_msg("Driver Closed Successfully")
-    except Exception as e:
-        catch(e)
+    except Exception:
         pass
 
     try:
         driver.quit()
         log_msg("Driver Quit Successfully")
-    except Exception as e:
-        catch(e)
+    except Exception:
         pass
+
 
 
 def randomText():
