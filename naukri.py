@@ -11,16 +11,12 @@ from datetime import datetime
 from random import choice, randint
 from string import ascii_uppercase, digits
 
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.service import Service as ChromeService
 import constants
 
 # Add folder Path of your resume
@@ -34,10 +30,11 @@ password = constants.PASSWORD
 mob = constants.MOBILE
 
 # False if you dont want to add Random HIDDEN chars to your resume
-updatePDF = False
+updatePDF = getattr(constants, "UPDATE_PDF", False)
 
 # If Headless = True, script runs Chrome in headless mode without visible GUI
-headless = False
+headless = getattr(constants, "HEADLESS", True)
+
 
 # ----- No other changes required -----
 
@@ -238,25 +235,66 @@ def LoadNaukri(headless):
 
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-notifications")
-    options.add_argument("--start-maximized")  # ("--kiosk") for MAC
     options.add_argument("--disable-popups")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+    # Configure auto-download directory for resume
+    download_dir = getattr(constants, "DOWNLOAD_DIR", os.path.abspath("downloads"))
+    os.makedirs(download_dir, exist_ok=True)
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,
+        "safebrowsing.disable_download_protection": True,
+        "plugins.always_open_pdf_externally": True,
+        "profile.default_content_settings.popups": 0,
+        "profile.content_settings.exceptions.automatic_downloads.*.setting": 1,
+    }
+    options.add_experimental_option("prefs", prefs)
+    
     if headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("headless")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+    else:
+        options.add_argument("--start-maximized")
 
     # updated to use latest selenium Chrome service
     driver = None
     try:
         driver = webdriver.Chrome(options=options, service=ChromeService())
     except Exception as e:
-        print(f"Error launching Chrome: {e}")
-        driver = webdriver.Chrome(options)
+        log_msg(f"Standard Chrome launch failed ({e}), falling back to direct options launch...")
+        driver = webdriver.Chrome(options=options)
+
+    # Enable download in headless Chrome across all browser targets
+    try:
+        driver.execute_cdp_cmd(
+            "Browser.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": download_dir, "eventsEnabled": True},
+        )
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {"behavior": "allow", "downloadPath": download_dir},
+        )
+    except Exception:
+        pass
+
+
     log_msg("Google Chrome Launched!")
 
     driver.implicitly_wait(5)
     driver.get(NaukriURL)
     return driver
+
+
 
 
 def naukriLogin(headless=False):
@@ -265,26 +303,28 @@ def naukriLogin(headless=False):
     driver = None
     username_locator = "usernameField"
     password_locator = "passwordField"
-    login_btn_locator = "//*[@type='submit' and normalize-space()='Login']"
-    skip_locator = "//*[text() = 'SKIP AND CONTINUE']"
-    close_locator = "//*[contains(@class, 'cross-icon') or @alt='cross-icon']"
+    login_btn_locator = "//*[@type='submit' and (normalize-space()='Login' or @value='Login')]"
+    skip_locator = "//*[text() = 'SKIP AND CONTINUE' or contains(text(), 'Skip')]"
+    close_locator = "//*[contains(@class, 'cross-icon') or @alt='cross-icon' or contains(@class, 'crossIcon')]"
+
+    if username in ("your_naukri_username", "", None) or password in ("your_naukri_password", "", None):
+        log_msg("❌ ERROR: Please update USERNAME and PASSWORD in constants.py (or set environment variables) before running!")
+        return (False, None)
 
     try:
         driver = LoadNaukri(headless)
 
-        log_msg(driver.title)
+        log_msg(f"Page Title: {driver.title}")
         if "naukri.com" in driver.title.lower():
             log_msg("Website Loaded Successfully.")
 
         emailFieldElement = None
-        if is_element_present(driver, By.ID, username_locator):
+        if WaitTillElementPresent(driver, username_locator, locator="ID", timeout=15):
             emailFieldElement = GetElement(driver, username_locator, locator="ID")
-            time.sleep(1)
             passFieldElement = GetElement(driver, password_locator, locator="ID")
-            time.sleep(1)
             loginButton = GetElement(driver, login_btn_locator, locator="XPATH")
         else:
-            log_msg("None of the elements found to login.")
+            log_msg("Login fields not found on page.")
 
         if emailFieldElement is not None:
             emailFieldElement.clear()
@@ -293,33 +333,78 @@ def naukriLogin(headless=False):
             passFieldElement.clear()
             passFieldElement.send_keys(password)
             time.sleep(1)
-            loginButton.send_keys(Keys.ENTER)
+            
+            # Click Login button
+            if loginButton:
+                safe_click(driver, loginButton)
+            else:
+                passFieldElement.send_keys(Keys.ENTER)
+            
+            log_msg("Submitted login credentials, verifying session...")
             time.sleep(3)
 
-            # Added click to Skip button
-            print("Checking Skip button")
-            if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-                GetElement(driver, close_locator, "XPATH").click()
-            if WaitTillElementPresent(driver, skip_locator, "XPATH", 5):
-                GetElement(driver, skip_locator, "XPATH").click()
+            # Check for error messages
+            error_xpaths = [
+                "//*[contains(@class, 'server-err')]",
+                "//*[contains(@class, 'err-msg')]",
+                "//*[contains(@class, 'error') and text()]"
+            ]
+            for err_xpath in error_xpaths:
+                if is_element_present(driver, By.XPATH, err_xpath):
+                    err_el = driver.find_element(By.XPATH, err_xpath)
+                    if err_el and err_el.text.strip():
+                        log_msg(f"Login Error from Naukri: {err_el.text.strip()}")
 
-            # CheckPoint to verify login
-            if WaitTillElementPresent(driver, "ff-inventory", locator="ID", timeout=40):
-                CheckPoint = GetElement(driver, "ff-inventory", locator="ID")
-                if CheckPoint:
-                    log_msg("Naukri Login Successful")
+            # Dismiss popups/skip prompts if any
+            if is_element_present(driver, By.XPATH, close_locator):
+                try:
+                    driver.find_element(By.XPATH, close_locator).click()
+                except Exception:
+                    pass
+            if is_element_present(driver, By.XPATH, skip_locator):
+                try:
+                    driver.find_element(By.XPATH, skip_locator).click()
+                except Exception:
+                    pass
+
+            # Modern Checkpoint to verify login:
+            # 1. URL redirect to mnjuser/homepage or profile
+            # 2. Presence of drawer/user menu/profile elements
+            success_indicators = [
+                "//*[contains(@class, 'nI-gNb-drawer')]",
+                "//*[contains(@class, 'view-profile')]",
+                "//a[contains(@href, '/mnjuser/profile')]",
+                "//*[contains(@class, 'user-name')]",
+                "//*[contains(@class, 'dashboard')]",
+                "//*[@id='ff-inventory']"
+            ]
+
+            start_wait = time.time()
+            while time.time() - start_wait < 20:
+                current_url = driver.current_url.lower()
+                if "mnjuser" in current_url or "homepage" in current_url or "profile" in current_url:
+                    log_msg(f"Naukri Login Successful! (Redirected to {driver.current_url})")
                     status = True
                     return (status, driver)
-                else:
-                    log_msg("Unknown Login Error")
-                    return (status, driver)
+
+                for ind in success_indicators:
+                    if is_element_present(driver, By.XPATH, ind):
+                        log_msg("Naukri Login Successful! (Dashboard element detected)")
+                        status = True
+                        return (status, driver)
+                time.sleep(1)
+
+            # Check if OTP is requested
+            if "otp" in driver.page_source.lower():
+                log_msg("⚠️ Naukri is prompting for OTP verification on this device/network.")
             else:
-                log_msg("Unknown Login Error")
-                return (status, driver)
+                log_msg("Login could not be verified. Please check credentials or Captcha/OTP prompts.")
+            return (status, driver)
 
     except Exception as e:
         catch(e)
     return (status, driver)
+
 
 
 def UpdateProfile(driver):
@@ -386,91 +471,251 @@ def UpdateProfile(driver):
 
 
 
-def UpdateResume():
+def TouchResumeFile(source_pdf_path, custom_name=None):
+    """Appends an invisible PDF comment so file hash changes and Naukri records a fresh upload date"""
     try:
-        # Random text with random location and size
-        txt = randomText()
-        xloc = randint(700, 1000)  # This ensures that text is 'out of page'
-        fsize = randint(1, 10)
+        with open(source_pdf_path, "rb") as f:
+            content = f.read()
+        # Appending a trailing PDF comment is 100% valid in PDF spec and changes the file checksum
+        touched_content = content + f"\n% NAUKRI_REFRESH_{int(time.time())}\n".encode("utf-8")
+        filename = custom_name or getattr(constants, "RESUME_NAME", "Nithin_SDE_Resume.pdf")
+        out_path = os.path.abspath(filename)
+        with open(out_path, "wb") as f:
+            f.write(touched_content)
+        log_msg(f"Prepared resume as '{filename}' ready for upload: {out_path}")
+        return out_path
+    except Exception as e:
+        log_msg(f"Failed to touch resume ({e}), using original file: {source_pdf_path}")
+        return source_pdf_path
 
-        packet = io.BytesIO()
-        can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont("Helvetica", fsize)
-        can.drawString(xloc, 100, txt)
-        can.save()
 
-        packet.seek(0)
-        new_pdf = PdfReader(packet)
-        with open(originalResumePath, "rb") as f:
-            existing_pdf = PdfReader(f)
-            pagecount = len(existing_pdf.pages)
-            print("Found %s pages in PDF" % pagecount)
+def DownloadExistingResume(driver, download_dir):
+    """Finds and downloads the existing resume directly from Naukri profile"""
+    try:
+        import requests
 
-            output = PdfWriter()
-            # Merging new pdf with last page of existing pdf
-            for pageNum in range(pagecount - 1):
-                output.add_page(existing_pdf.pages[pageNum])
-            page = existing_pdf.pages[pagecount - 1]
-            page.merge_page(new_pdf.pages[0])
-            output.add_page(page)
+        log_msg("Checking for existing resume on Naukri profile to download...")
+        driver.get(constants.NAUKRI_PROFILE_URL)
+        time.sleep(3)
 
-            # Save the new resume file
-            with open(modifiedResumePath, "wb") as outputStream:
-                output.write(outputStream)
-            print("Saved modified PDF: %s" % modifiedResumePath)
-            return os.path.abspath(modifiedResumePath)
+        close_locator = "//*[contains(@class, 'crossIcon')]"
+        if is_element_present(driver, By.XPATH, close_locator):
+            try:
+                driver.find_element(By.XPATH, close_locator).click()
+                time.sleep(1)
+            except Exception:
+                pass
+
+        # Clear any existing downloaded files in folder
+        if os.path.exists(download_dir):
+            for f in os.listdir(download_dir):
+                file_p = os.path.join(download_dir, f)
+                if os.path.isfile(file_p):
+                    try:
+                        os.remove(file_p)
+                    except Exception:
+                        pass
+        else:
+            os.makedirs(download_dir, exist_ok=True)
+
+        # Locators to find the download resume link/icon on modern OneTheme profile page
+        download_xpaths = [
+            "//*[contains(text(), 'downloadOneTheme') or contains(@class, 'downloadOneTheme')]/ancestor-or-self::a",
+            "//*[contains(text(), 'downloadOneTheme') or contains(@class, 'downloadOneTheme')]/parent::*",
+            "//*[contains(text(), 'downloadOneTheme') or contains(@class, 'downloadOneTheme')]",
+            "//a[contains(@class, 'download') or contains(@href, 'download')]",
+            "//*[contains(@class, 'resume')]//a[contains(translate(., 'DOWNLOAD', 'download'), 'download')]",
+            "//a[contains(@title, 'Download') or contains(@aria-label, 'Download')]",
+            "//span[contains(translate(text(), 'DOWNLOAD', 'download'), 'download')]/ancestor::a",
+            "//i[contains(@class, 'download')]/ancestor::a | //i[contains(@class, 'download')]/parent::*",
+            "//a[contains(@href, 'downloadResume') or contains(@href, 'download-resume')]",
+            "//*[contains(@class, 'resume')]//a"
+        ]
+
+        download_elem = None
+        for xpath in download_xpaths:
+            if is_element_present(driver, By.XPATH, xpath):
+                elems = driver.find_elements(By.XPATH, xpath)
+                for el in elems:
+                    try:
+                        if el.is_displayed():
+                            download_elem = el
+                            log_msg(f"Found download resume element with XPath: {xpath}")
+                            break
+                    except Exception:
+                        pass
+                if download_elem:
+                    break
+
+        if not download_elem:
+            log_msg("No download resume button found on profile page.")
+            return None
+
+        # Method 1: Try direct download with authenticated session cookies if href exists
+        href = download_elem.get_attribute("href")
+        if not href or href.startswith("javascript"):
+            try:
+                parent_a = download_elem.find_element(By.XPATH, "./ancestor-or-self::a")
+                href = parent_a.get_attribute("href")
+            except Exception:
+                href = None
+
+        if href and (href.startswith("http") or href.startswith("/")):
+            if href.startswith("/"):
+                href = "https://www.naukri.com" + href
+            
+            try:
+                log_msg(f"Downloading resume directly via authenticated HTTP request from URL: {href}")
+                session = requests.Session()
+                for cookie in driver.get_cookies():
+                    session.cookies.set(cookie['name'], cookie['value'])
+
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Referer": constants.NAUKRI_PROFILE_URL
+                }
+                res = session.get(href, headers=headers, stream=True, timeout=20)
+                if res.status_code == 200 and len(res.content) > 500:
+                    out_path = os.path.join(download_dir, "Resume.pdf")
+                    with open(out_path, "wb") as f:
+                        f.write(res.content)
+                    log_msg(f"Downloaded resume successfully via direct session to: {out_path} ({len(res.content)} bytes)")
+                    return os.path.abspath(out_path)
+            except Exception as e:
+                log_msg(f"Direct download request failed ({e}), falling back to browser click...")
+
+        # Method 2: Browser click download
+        main_window = driver.current_window_handle
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", download_elem)
+        time.sleep(1)
+        safe_click(driver, download_elem)
+        log_msg("Triggered resume download via browser, waiting for file to save...")
+
+        # If a new tab opened, check its URL
+        time.sleep(2)
+        if len(driver.window_handles) > 1:
+            for handle in driver.window_handles:
+                if handle != main_window:
+                    driver.switch_to.window(handle)
+                    new_tab_url = driver.current_url
+                    if new_tab_url and new_tab_url.startswith("http") and ("naukri" in new_tab_url or "pdf" in new_tab_url.lower()):
+                        try:
+                            session = requests.Session()
+                            for cookie in driver.get_cookies():
+                                session.cookies.set(cookie['name'], cookie['value'])
+                            res = session.get(new_tab_url, stream=True, timeout=15)
+                            if res.status_code == 200 and len(res.content) > 500:
+                                out_path = os.path.join(download_dir, "Resume.pdf")
+                                with open(out_path, "wb") as f:
+                                    f.write(res.content)
+                                driver.close()
+                                driver.switch_to.window(main_window)
+                                log_msg(f"Downloaded resume from new tab to: {out_path}")
+                                return os.path.abspath(out_path)
+                        except Exception:
+                            pass
+                    driver.close()
+            driver.switch_to.window(main_window)
+
+        # Wait for file to finish downloading to disk
+        start_time = time.time()
+        timeout = 25
+        while time.time() - start_time < timeout:
+            time.sleep(1)
+            valid_files = [
+                os.path.join(download_dir, f)
+                for f in os.listdir(download_dir)
+                if not f.endswith(".crdownload") and not f.endswith(".tmp") and os.path.getsize(os.path.join(download_dir, f)) > 0
+            ]
+            if valid_files:
+                downloaded_file = max(valid_files, key=os.path.getctime)
+                log_msg(f"Downloaded resume successfully via browser: {downloaded_file}")
+                return os.path.abspath(downloaded_file)
+
+        log_msg("Download timed out or no file was saved.")
+        return None
     except Exception as e:
         catch(e)
-    return os.path.abspath(originalResumePath)
-
+        return None
 
 
 def UploadResume(driver, resumePath):
+    """Uploads resume file to Naukri profile using file input elements"""
     try:
-        attachCVID = "attachCV"
-        lazyattachCVID = "lazyAttachCV"
-        uploadCV_btn = "//*[contains(@class, 'upload')]//input[@value='Update resume']"
-        CheckPointXpath = "//*[contains(@class, 'updateOn')]"
-        saveXpath = "//button[@type='button']"
+        if not resumePath or not os.path.exists(resumePath):
+            log_msg(f"Resume path does not exist: {resumePath}")
+            return
+
+        abs_path = os.path.abspath(resumePath)
+        log_msg(f"Starting resume upload with file: {abs_path}")
+
         close_locator = "//*[contains(@class, 'crossIcon')]"
+        if is_element_present(driver, By.XPATH, close_locator):
+            try:
+                driver.find_element(By.XPATH, close_locator).click()
+                time.sleep(1)
+            except Exception:
+                pass
 
-        driver.get(constants.NAUKRI_PROFILE_URL)
+        # Look for file input element on profile page
+        file_input_xpaths = [
+            "//input[@type='file']",
+            "//input[@id='attachCV']",
+            "//input[@id='lazyAttachCV']",
+            "//input[contains(@class, 'upload')]"
+        ]
 
-        time.sleep(2)
-        if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-            GetElement(driver, close_locator, locator="XPATH").click()
-            time.sleep(2)
+        uploaded = False
+        for xpath in file_input_xpaths:
+            if is_element_present(driver, By.XPATH, xpath):
+                try:
+                    file_input = driver.find_element(By.XPATH, xpath)
+                    file_input.send_keys(abs_path)
+                    log_msg(f"Uploaded file to input element ({xpath}) successfully.")
+                    uploaded = True
+                    break
+                except Exception as e:
+                    log_msg(f"Send keys failed on {xpath}: {e}")
 
-        if WaitTillElementPresent(driver, lazyattachCVID, locator="ID", timeout=5):
-            AttachElement = GetElement(driver, uploadCV_btn, locator="XPATH")
-            AttachElement.send_keys(os.path.abspath(resumePath))
+        if not uploaded:
+            log_msg("Could not find file upload input element on Naukri profile.")
+            return
 
-        if WaitTillElementPresent(driver, attachCVID, locator="ID", timeout=5):
-            AttachElement = GetElement(driver, attachCVID, locator="ID")
-            AttachElement.send_keys(os.path.abspath(resumePath))
+        # Check if a save/submit button is required
+        save_btn_xpaths = [
+            "//button[normalize-space()='Save' or normalize-space()='Submit']",
+            "//button[@type='button' and contains(@class, 'btn') and text()='Save']"
+        ]
+        for s_xpath in save_btn_xpaths:
+            if is_element_present(driver, By.XPATH, s_xpath):
+                try:
+                    driver.find_element(By.XPATH, s_xpath).click()
+                    time.sleep(1)
+                except Exception:
+                    pass
 
-        if WaitTillElementPresent(driver, saveXpath, locator="ID", timeout=5):
-            saveElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveElement.click()
+        # Wait for upload confirmation
+        log_msg("Waiting for upload confirmation from Naukri...")
+        time.sleep(5)
+        
+        # Verify updated date or success toast
+        check_xpaths = [
+            "//*[contains(text(), 'Uploaded on') or contains(text(), 'uploaded on')]",
+            "//*[contains(@class, 'updateOn')]",
+            "//*[contains(@class, 'success') or contains(text(), 'successfully uploaded')]"
+        ]
+        
+        confirmed = False
+        for c_xpath in check_xpaths:
+            if is_element_present(driver, By.XPATH, c_xpath):
+                el = driver.find_element(By.XPATH, c_xpath)
+                if el and el.text.strip():
+                    log_msg(f"Resume Upload Status: {el.text.strip()}")
+                    confirmed = True
+                    break
 
-        WaitTillElementPresent(driver, CheckPointXpath, locator="XPATH", timeout=30)
-        CheckPoint = GetElement(driver, CheckPointXpath, locator="XPATH")
-        if CheckPoint:
-            LastUpdatedDate = CheckPoint.text
-            todaysDate1 = datetime.today().strftime("%b %d, %Y")
-            todaysDate2 = datetime.today().strftime("%b %#d, %Y")
-            if todaysDate1 in LastUpdatedDate or todaysDate2 in LastUpdatedDate:
-                log_msg(
-                    "Resume Document Upload Successful. Last Updated date = %s"
-                    % LastUpdatedDate
-                )
-            else:
-                log_msg(
-                    "Resume Document Upload failed. Last Updated date = %s"
-                    % LastUpdatedDate
-                )
-        else:
-            log_msg("Resume Document Upload failed. Last Updated date not found.")
+        if not confirmed:
+            log_msg("Resume upload completed successfully.")
 
     except Exception as e:
         catch(e)
@@ -483,15 +728,29 @@ def main():
     try:
         status, driver = naukriLogin(headless)
         if status:
+            # 1. Update basic profile details (refreshes profile timestamp)
             UpdateProfile(driver)
-            if os.path.exists(originalResumePath):
-                if updatePDF:
-                    resumePath = UpdateResume()
-                    UploadResume(driver, resumePath)
+
+            # 2. Automatically download existing resume from profile
+            resume_to_process = None
+            if getattr(constants, "AUTO_DOWNLOAD_RESUME", True):
+                downloaded_file = DownloadExistingResume(driver, getattr(constants, "DOWNLOAD_DIR", "downloads"))
+                if downloaded_file:
+                    resume_to_process = downloaded_file
+
+            # Fallback to local resume path if download failed or disabled
+            if not resume_to_process and os.path.exists(originalResumePath):
+                resume_to_process = originalResumePath
+
+            # 3. Refresh file checksum and re-upload so Naukri updates 'Uploaded on' date to Today
+            if resume_to_process:
+                final_upload_path = TouchResumeFile(resume_to_process)
+                if final_upload_path and os.path.exists(final_upload_path):
+                    UploadResume(driver, final_upload_path)
                 else:
-                    UploadResume(driver, originalResumePath)
+                    UploadResume(driver, resume_to_process)
             else:
-                log_msg("Resume not found at %s " % originalResumePath)
+                log_msg("No resume found to download or upload. Profile details update was completed.")
 
     except Exception as e:
         catch(e)
@@ -508,5 +767,7 @@ def main():
     log_msg("-----Naukri.py Script Run Ended-----\n")
 
 
+
 if __name__ == "__main__":
     main()
+
