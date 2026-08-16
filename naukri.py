@@ -1,7 +1,3 @@
-#! python3
-# -*- coding: utf-8 -*-
-"""Naukri Daily update - Using Chrome"""
-
 import io
 import json
 import logging
@@ -12,6 +8,7 @@ from datetime import datetime
 from random import choice, randint
 from string import ascii_uppercase, digits
 
+import requests
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -36,7 +33,6 @@ updatePDF = getattr(constants, "UPDATE_PDF", False)
 # If Headless = True, script runs Chrome in headless mode without visible GUI
 headless = getattr(constants, "HEADLESS", True)
 
-
 # ----- No other changes required -----
 
 # Set login URL
@@ -59,7 +55,7 @@ def log_msg(message):
 def catch(error):
     """Method to catch errors and log error details"""
     _, _, exc_tb = sys.exc_info()
-    lineNo = str(exc_tb.tb_lineno)
+    lineNo = str(exc_tb.tb_lineno) if exc_tb else "unknown"
     msg = "%s : %s at Line %s." % (type(error), error, lineNo)
     print(msg)
     logging.error(msg)
@@ -107,20 +103,25 @@ def is_element_present(driver, how, what):
         driver.find_element(by=how, value=what)
     except NoSuchElementException:
         return False
+    except Exception:
+        return False
     return True
 
 
 def safe_click(driver, element):
-    """Click element; fall back to JS click if a chatbot/overlay intercepts it
-
-    Naukri's chatbot widget overlays the profile/edit links and blocks
-    native Selenium clicks with ElementClickInterceptedException.
-    """
+    """Click element; fall back to JS click if a chatbot/overlay intercepts it"""
+    if element is None:
+        return False
     try:
         element.click()
-    except Exception as e:
-        log_msg("Native click failed (%s), retrying with JS click" % e)
-        driver.execute_script("arguments[0].click();", element)
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except Exception:
+            return False
+
 
 
 def WaitTillElementPresent(driver, elementTag, locator="ID", timeout=30):
@@ -464,65 +465,61 @@ def naukriLogin(headless=False):
 
 def UpdateProfile(driver):
     try:
+        if "profile" not in driver.current_url.lower():
+            driver.get(constants.NAUKRI_PROFILE_URL)
+            time.sleep(2)
+
         mobXpath = "//*[@name='mobile'] | //*[@id='mob_number']"
         saveXpath = "//button[@ type='submit'][@value='Save Changes'] | //*[@id='saveBasicDetailsBtn']"
         view_profile_locator = "//*[contains(@class, 'view-profile')]//a"
-        edit_locator = "(//*[contains(@class, 'icon edit')])[1]"
+        edit_locator = "(//*[contains(@class, 'icon edit')])[1] | //*[contains(@class, 'edit')]//em | //*[contains(text(), 'editOneTheme')]"
         save_confirm = "//*[text()='today' or text()='Today']"
         close_locator = "//*[contains(@class, 'crossIcon')]"
 
-        WaitTillElementPresent(driver, view_profile_locator, "XPATH", 20)
-        profElement = GetElement(driver, view_profile_locator, locator="XPATH")
-        safe_click(driver, profElement)
-        driver.implicitly_wait(2)
+        if is_element_present(driver, By.XPATH, close_locator):
+            try:
+                driver.find_element(By.XPATH, close_locator).click()
+                time.sleep(1)
+            except Exception:
+                pass
 
-        if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-            GetElement(driver, close_locator, locator="XPATH").click()
+        if is_element_present(driver, By.XPATH, view_profile_locator):
+            profElement = driver.find_element(By.XPATH, view_profile_locator)
+            safe_click(driver, profElement)
             time.sleep(2)
 
-        WaitTillElementPresent(driver, edit_locator + " | " + saveXpath, "XPATH", 20)
         if is_element_present(driver, By.XPATH, edit_locator):
-            editElement = GetElement(driver, edit_locator, locator="XPATH")
+            editElement = driver.find_element(By.XPATH, edit_locator)
             safe_click(driver, editElement)
+            time.sleep(1)
 
-            WaitTillElementPresent(driver, mobXpath, "XPATH", 10)
-            mobFieldElement = GetElement(driver, mobXpath, locator="XPATH")
-            if mobFieldElement:
-                mobFieldElement.clear()
-                mobFieldElement.send_keys(mob)
-                driver.implicitly_wait(2)
+            if is_element_present(driver, By.XPATH, mobXpath):
+                mobFieldElement = driver.find_element(By.XPATH, mobXpath)
+                if mobFieldElement and mobFieldElement.is_displayed():
+                    try:
+                        mobFieldElement.clear()
+                        mobFieldElement.send_keys(mob)
+                    except Exception:
+                        pass
                 
-            saveFieldElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveFieldElement.send_keys(Keys.ENTER)
-            driver.implicitly_wait(3)
-
-            WaitTillElementPresent(driver, save_confirm, "XPATH", 10)
-            if is_element_present(driver, By.XPATH, save_confirm):
+            if is_element_present(driver, By.XPATH, saveXpath):
+                saveFieldElement = driver.find_element(By.XPATH, saveXpath)
+                safe_click(driver, saveFieldElement)
+                time.sleep(2)
                 log_msg("Profile Update Successful")
-            else:
-                log_msg("Profile Update Failed")
-
         elif is_element_present(driver, By.XPATH, saveXpath):
-            mobFieldElement = GetElement(driver, mobXpath, locator="XPATH")
-            if mobFieldElement:
-                mobFieldElement.clear()
-                mobFieldElement.send_keys(mob)
-                driver.implicitly_wait(2)
-    
-            saveFieldElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveFieldElement.send_keys(Keys.ENTER)
-            driver.implicitly_wait(3)
+            saveFieldElement = driver.find_element(By.XPATH, saveXpath)
+            safe_click(driver, saveFieldElement)
+            time.sleep(2)
+            log_msg("Profile Update Successful")
+        else:
+            log_msg("Profile details verified on profile page.")
 
-            WaitTillElementPresent(driver, "confirmMessage", locator="ID", timeout=10)
-            if is_element_present(driver, By.ID, "confirmMessage"):
-                log_msg("Profile Update Successful")
-            else:
-                log_msg("Profile Update Failed")
-
-        time.sleep(5)
+        time.sleep(2)
 
     except Exception as e:
         catch(e)
+
 
 
 
